@@ -1,0 +1,23 @@
+name = "mygpt-browser-mcp"
+main = "src/index.ts"
+compatibility_date = "2026-09-19"
+compatibility_flags = ["nodejs_compat", "no_websocket_standard_binary_type", "global_fetch_strictly_public"]
+
+[browser]
+binding = "BROWSER"
+
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "a866fcbda5c94c50bc2537e314234dac"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PlaywrightMCP"]
+
+[[durable_objects.bindings]]
+name = "MCP_OBJECT"
+class_name = "PlaywrightMCP"
+
+[[routes]]
+pattern = "browser.202820.xyz"
+custom_domain = true
