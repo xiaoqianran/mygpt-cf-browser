@@ -191,8 +191,10 @@ function authPage(
     headers: {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
+      // Chrome also applies form-action to redirects after form submission.
+      // target is safe here because parseAuthRequest validated redirectUri first.
       "Content-Security-Policy":
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        `default-src 'none'; style-src 'unsafe-inline'; form-action ${ORIGIN} ${target}; base-uri 'none'; frame-ancestors 'none'`,
       "Referrer-Policy": "no-referrer",
       "X-Content-Type-Options": "nosniff",
       "X-Frame-Options": "DENY",
