@@ -1,6 +1,6 @@
 # mygpt-cf-browser
 
-Cloudflare-hosted Playwright MCP for ChatGPT and other remote MCP clients.
+Remote browser automation for ChatGPT and other MCP clients, powered by Cloudflare Browser Rendering.
 
 ## Architecture
 
@@ -11,22 +11,34 @@ ChatGPT / MCP Client
         v
 Cloudflare Worker
         |
-        +-- @cloudflare/workers-oauth-provider
-        |     +-- OAuth discovery
-        |     +-- authorization code
-        |     +-- access / refresh tokens
-        |     +-- CIMD
-        |     +-- DCR fallback
-        |     \-- OAUTH_KV
+        +-- OAuth discovery / token endpoints
         |
-        +-- @cloudflare/playwright-mcp
-              |
-              v
-        Durable Object
-              |
-              v
-      Cloudflare Browser Run
+        +-- /authorize
+        |      |
+        |      v
+        |   Cloudflare Access
+        |      |
+        |      +-- Cloudflare account login
+        |      +-- Account Member policy
+        |      \-- consent-only Authorize
+        |
+        +-- @cloudflare/workers-oauth-provider
+        |      +-- authorization code
+        |      +-- access / refresh tokens
+        |      +-- CIMD
+        |      +-- DCR fallback
+        |      \-- OAUTH_KV
+        |
+        \-- @cloudflare/playwright-mcp
+               |
+               v
+         Durable Object
+               |
+               v
+       Cloudflare Browser Rendering
 ```
+
+Only `/authorize` is protected by Cloudflare Access. The MCP endpoint, OAuth discovery endpoints, and token endpoint remain machine-accessible so remote MCP clients can complete OAuth discovery and token exchange.
 
 ## Production endpoint
 
@@ -47,7 +59,14 @@ npx wrangler deploy
 
 Update the `OAUTH_KV` namespace ID in `wrangler.toml` after creating a namespace.
 
-`MCP_TOKEN` is used only as the single-user authorization password and as the root secret for signing the authorization form. It is not used as a permanent MCP Bearer token.
+Configure Cloudflare Access for the `/authorize` path with:
+
+- Cloudflare as the identity provider
+- `restrict_to_account_members = true`
+- an Allow policy using the Cloudflare Account Member selector
+- automatic redirect to the Cloudflare identity provider
+
+`MCP_TOKEN` is an internal signing secret used only to protect the consent form against tampering. Users never enter it, and it is never used as a permanent MCP Bearer token.
 
 ## Verification
 
@@ -55,7 +74,9 @@ Update the `OAUTH_KV` namespace ID in `wrangler.toml` after creating a namespace
 node verify.mjs
 ```
 
-The verification flow checks OAuth discovery, DCR, PKCE, authorization, access and refresh tokens, MCP tool listing, and a live `browser_navigate` call.
+The smoke test checks the MCP OAuth challenge, protected-resource discovery, authorization-server discovery, DCR, PKCE construction, and that only `/authorize` is intercepted by Cloudflare Access.
+
+The final authorization-code and token flow is intentionally interactive because Cloudflare Access verifies the user's Cloudflare account before the consent page is shown.
 
 ## Secrets
 

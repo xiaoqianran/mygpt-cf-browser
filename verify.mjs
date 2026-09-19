@@ -1,24 +1,10 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 const origin = "https://browser.202820.xyz";
 const mcpUrl = origin + "/mcp";
-const password = fs.readFileSync(".mcp-token", "utf8").trim();
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
-}
-
-function formValue(html, name) {
-  const pattern =
-    'name=["\\\']' +
-    name +
-    '["\\\'][^>]*value=["\\\']([^"\\\']+)["\\\']';
-  const match = html.match(new RegExp(pattern));
-  if (!match) throw new Error("Missing form field: " + name);
-  return match[1].replace(/&quot;/g, '"').replace(/&amp;/g, "&");
 }
 
 function base64url(input) {
@@ -33,13 +19,19 @@ assert(
 const challenge = challengeResponse.headers.get("www-authenticate") ?? "";
 assert(
   challenge.includes("resource_metadata="),
-  "Missing resource_metadata challenge",
+  "Missing OAuth resource_metadata challenge",
 );
-console.log("401 challenge OK");
+assert(
+  !challenge.includes("Cloudflare-Access"),
+  "/mcp must not be protected by Cloudflare Access",
+);
+console.log("MCP OAuth challenge OK");
 
-const resourceMeta = await fetch(
+const resourceMetaResponse = await fetch(
   origin + "/.well-known/oauth-protected-resource/mcp",
-).then((r) => r.json());
+);
+assert(resourceMetaResponse.ok, "Protected-resource discovery failed");
+const resourceMeta = await resourceMetaResponse.json();
 assert(
   resourceMeta.resource === mcpUrl,
   "Protected resource metadata has wrong resource",
@@ -50,9 +42,11 @@ assert(
 );
 console.log("protected-resource discovery OK");
 
-const serverMeta = await fetch(
+const serverMetaResponse = await fetch(
   origin + "/.well-known/oauth-authorization-server",
-).then((r) => r.json());
+);
+assert(serverMetaResponse.ok, "Authorization-server discovery failed");
+const serverMeta = await serverMetaResponse.json();
 assert(
   serverMeta.authorization_endpoint === origin + "/authorize",
   "Wrong authorization endpoint",
@@ -80,7 +74,7 @@ const registrationResponse = await fetch(origin + "/oauth/register", {
   method: "POST",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({
-    client_name: "mygpt-browser-verify",
+    client_name: "mygpt-cf-browser-verify",
     redirect_uris: [redirectUri],
     grant_types: ["authorization_code", "refresh_token"],
     response_types: ["code"],
@@ -96,8 +90,7 @@ if (!registrationResponse.ok) {
   );
 }
 const registration = await registrationResponse.json();
-const clientId = registration.client_id;
-assert(clientId, "DCR did not return client_id");
+assert(registration.client_id, "DCR did not return client_id");
 console.log("DCR OK");
 
 const verifier = base64url(crypto.randomBytes(48));
@@ -107,7 +100,7 @@ const challengeValue = base64url(
 const state = base64url(crypto.randomBytes(18));
 const authorizeUrl = new URL(origin + "/authorize");
 authorizeUrl.searchParams.set("response_type", "code");
-authorizeUrl.searchParams.set("client_id", clientId);
+authorizeUrl.searchParams.set("client_id", registration.client_id);
 authorizeUrl.searchParams.set("redirect_uri", redirectUri);
 authorizeUrl.searchParams.set("scope", "browser");
 authorizeUrl.searchParams.set("state", state);
@@ -115,154 +108,27 @@ authorizeUrl.searchParams.set("code_challenge", challengeValue);
 authorizeUrl.searchParams.set("code_challenge_method", "S256");
 authorizeUrl.searchParams.set("resource", mcpUrl);
 
-const authorizeGet = await fetch(authorizeUrl);
-assert(authorizeGet.ok, "Authorize GET failed: " + authorizeGet.status);
-const html = await authorizeGet.text();
-const expiresAt = formValue(html, "expires_at");
-const signature = formValue(html, "signature");
-console.log("signed authorization form OK");
-
-const tamperedUrl = new URL(authorizeUrl);
-tamperedUrl.searchParams.set("state", state + "-tampered");
-const tamperedPost = await fetch(tamperedUrl, {
-  method: "POST",
+const authorizeResponse = await fetch(authorizeUrl, {
   redirect: "manual",
-  headers: { "Content-Type": "application/x-www-form-urlencoded" },
-  body: new URLSearchParams({
-    password,
-    expires_at: expiresAt,
-    signature,
-  }),
 });
 assert(
-  tamperedPost.status === 302 || tamperedPost.status === 400,
-  "Tampered form was not rejected",
+  authorizeResponse.status === 302,
+  "Expected Cloudflare Access redirect, got " + authorizeResponse.status,
 );
-console.log("tamper rejection OK");
-
-const wrongPasswordPost = await fetch(authorizeUrl, {
-  method: "POST",
-  redirect: "manual",
-  headers: { "Content-Type": "application/x-www-form-urlencoded" },
-  body: new URLSearchParams({
-    password: password + "-wrong",
-    expires_at: expiresAt,
-    signature,
-  }),
-});
+const accessLocation = authorizeResponse.headers.get("location") ?? "";
+const accessChallenge =
+  authorizeResponse.headers.get("www-authenticate") ?? "";
 assert(
-  wrongPasswordPost.status === 401,
-  "Wrong authorization password was not rejected",
+  accessLocation.includes("cloudflareaccess.com/cdn-cgi/access/login"),
+  "Authorization endpoint did not redirect to Cloudflare Access",
 );
-console.log("password rejection OK");
-
-const authorizePost = await fetch(authorizeUrl, {
-  method: "POST",
-  redirect: "manual",
-  headers: { "Content-Type": "application/x-www-form-urlencoded" },
-  body: new URLSearchParams({
-    password,
-    expires_at: expiresAt,
-    signature,
-  }),
-});
-if (authorizePost.status !== 302) {
-  throw new Error(
-    "Authorize POST failed: " +
-      authorizePost.status +
-      " " +
-      (await authorizePost.text()),
-  );
-}
-const location = authorizePost.headers.get("location");
-assert(location, "Authorization redirect missing");
-const callback = new URL(location);
 assert(
-  callback.searchParams.get("state") === state,
-  "OAuth state mismatch",
+  accessChallenge.includes("Cloudflare-Access"),
+  "Authorization endpoint missing Cloudflare Access challenge",
 );
-const code = callback.searchParams.get("code");
-assert(code, "Authorization code missing");
-console.log("authorization code OK");
+console.log("Cloudflare Access boundary OK");
 
-const tokenResponse = await fetch(origin + "/oauth/token", {
-  method: "POST",
-  headers: { "Content-Type": "application/x-www-form-urlencoded" },
-  body: new URLSearchParams({
-    grant_type: "authorization_code",
-    client_id: clientId,
-    code,
-    redirect_uri: redirectUri,
-    code_verifier: verifier,
-    resource: mcpUrl,
-  }),
-});
-if (!tokenResponse.ok) {
-  throw new Error(
-    "Token exchange failed: " +
-      tokenResponse.status +
-      " " +
-      (await tokenResponse.text()),
-  );
-}
-const token = await tokenResponse.json();
-assert(token.access_token, "Access token missing");
-assert(token.refresh_token, "Refresh token missing");
-console.log("access + refresh token OK");
-
-const refreshResponse = await fetch(origin + "/oauth/token", {
-  method: "POST",
-  headers: { "Content-Type": "application/x-www-form-urlencoded" },
-  body: new URLSearchParams({
-    grant_type: "refresh_token",
-    client_id: clientId,
-    refresh_token: token.refresh_token,
-    resource: mcpUrl,
-  }),
-});
-if (!refreshResponse.ok) {
-  throw new Error(
-    "Refresh failed: " +
-      refreshResponse.status +
-      " " +
-      (await refreshResponse.text()),
-  );
-}
-const refreshed = await refreshResponse.json();
-assert(refreshed.access_token, "Refreshed access token missing");
-console.log("refresh token OK");
-
-const client = new Client({
-  name: "mygpt-browser-verify",
-  version: "2.0.0",
-});
-const transport = new StreamableHTTPClientTransport(new URL(mcpUrl), {
-  requestInit: {
-    headers: {
-      Authorization: "Bearer " + refreshed.access_token,
-    },
-  },
-});
-
-await client.connect(transport);
-
-const listed = await client.listTools();
-assert(
-  listed.tools.some((tool) => tool.name === "browser_navigate"),
-  "browser_navigate missing",
+console.log("OAuth + Cloudflare Access smoke PASS");
+console.log(
+  "Interactive token issuance is completed by signing in with the Cloudflare account and pressing Authorize.",
 );
-console.log("listTools OK (" + listed.tools.length + " tools)");
-
-const nav = await client.callTool({
-  name: "browser_navigate",
-  arguments: { url: "https://example.com" },
-});
-const navText = JSON.stringify(nav.content);
-assert(
-  navText.toLowerCase().includes("example"),
-  "browser_navigate result did not contain Example",
-);
-console.log("browser_navigate OK");
-
-await client.close();
-console.log("OAuth MCP E2E PASS");

@@ -126,20 +126,6 @@ async function verifyAuthRequest(
   }
 }
 
-async function sameSecret(candidate: string, expected: string): Promise<boolean> {
-  const [left, right] = await Promise.all([
-    crypto.subtle.digest("SHA-256", encoder.encode(candidate)),
-    crypto.subtle.digest("SHA-256", encoder.encode(expected)),
-  ]);
-  const a = new Uint8Array(left);
-  const b = new Uint8Array(right);
-  let diff = a.length ^ b.length;
-  for (let i = 0; i < Math.max(a.length, b.length); i++) {
-    diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
-  }
-  return diff === 0;
-}
-
 function authErrorRedirect(
   request: AuthRequest,
   code: string,
@@ -175,14 +161,9 @@ function authPage(
   clientName: string,
   expiresAt: number,
   signature: string,
-  errorMessage = "",
 ): Response {
   const requestedScopes = oauthRequest.scope.join(" ");
   const target = new URL(oauthRequest.redirectUri).origin;
-  const error = errorMessage
-    ? '<p class="error">' + escapeHtml(errorMessage) + "</p>"
-    : "";
-
   const html =
     '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
@@ -193,25 +174,20 @@ function authPage(
     "main{width:min(420px,calc(100vw - 40px));border:1px solid color-mix(in srgb,CanvasText 18%,transparent);border-radius:14px;padding:24px}" +
     "h1{margin:0 0 8px;font-size:20px}p{margin:8px 0;line-height:1.5;opacity:.82}" +
     "dl{margin:18px 0;font-size:13px}dt{opacity:.6;margin-top:10px}dd{margin:2px 0 0;overflow-wrap:anywhere}" +
-    "label{display:block;margin:18px 0 6px;font-size:13px}" +
-    "input{box-sizing:border-box;width:100%;padding:11px 12px;border-radius:9px;border:1px solid color-mix(in srgb,CanvasText 22%,transparent);background:Canvas;color:CanvasText}" +
     "button{width:100%;margin-top:12px;padding:11px 14px;border:0;border-radius:9px;font-weight:650;cursor:pointer}" +
-    ".error{color:#c62828;opacity:1}</style></head><body><main>" +
+    "</style></head><body><main>" +
     "<h1>Authorize Browser MCP</h1>" +
-    "<p>Grant this OAuth client access to the Cloudflare Playwright MCP.</p>" +
+    "<p>Your Cloudflare account has been verified. Grant this OAuth client access to the Playwright MCP.</p>" +
     "<dl><dt>Client</dt><dd>" + escapeHtml(clientName) + "</dd>" +
     "<dt>Scope</dt><dd>" + escapeHtml(requestedScopes) + "</dd>" +
     "<dt>Redirect</dt><dd>" + escapeHtml(target) + "</dd></dl>" +
-    error +
     '<form method="post" action="' + escapeHtml(request.url) + '">' +
     '<input type="hidden" name="expires_at" value="' + expiresAt + '">' +
     '<input type="hidden" name="signature" value="' + escapeHtml(signature) + '">' +
-    '<label for="password">Authorization password</label>' +
-    '<input id="password" name="password" type="password" autocomplete="current-password" required autofocus>' +
     '<button type="submit">Authorize</button></form></main></body></html>';
 
   return new Response(html, {
-    status: errorMessage ? 401 : 200,
+    status: 200,
     headers: {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
@@ -275,7 +251,6 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
   }
 
   const form = await request.formData();
-  const password = String(form.get("password") ?? "");
   const signature = String(form.get("signature") ?? "");
   const expiresAt = Number(form.get("expires_at"));
   const now = Math.floor(Date.now() / 1000);
@@ -295,17 +270,6 @@ async function handleAuthorize(request: Request, env: Env): Promise<Response> {
       status: 400,
       headers: { "Cache-Control": "no-store" },
     });
-  }
-
-  if (!(await sameSecret(password, env.MCP_TOKEN))) {
-    return authPage(
-      request,
-      oauthRequest,
-      clientName,
-      expiresAt,
-      signature,
-      "Incorrect authorization password.",
-    );
   }
 
   const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
