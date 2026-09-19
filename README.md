@@ -29,16 +29,25 @@ Cloudflare Worker
         |      +-- DCR fallback
         |      \-- OAUTH_KV
         |
-        \-- @cloudflare/playwright-mcp
+        \-- stable MCP router
                |
+               | OAuth user affinity
                v
          Durable Object
                |
-               v
-       Cloudflare Browser Rendering
+               +-- Playwright MCP server
+               +-- persisted Browser Run session ID
+               \-- reconnect / adopt / acquire
+                         |
+                         v
+                 Cloudflare Browser Run
 ```
 
 Only `/authorize` is protected by Cloudflare Access. The MCP endpoint, OAuth discovery endpoints, and token endpoint remain machine-accessible so remote MCP clients can complete OAuth discovery and token exchange.
+
+ChatGPT may recreate its MCP transport between tool calls. The Worker therefore routes every authenticated OAuth user to a stable Durable Object instead of coupling browser state to the transient MCP transport session. The Durable Object owns the Playwright connection and persists the Cloudflare Browser Run session ID, so navigation state, tabs, and cookies can survive MCP transport recreation while the Browser Run session remains active.
+
+`@cloudflare/playwright-mcp@0.0.5` does not expose a session-aware connection factory. `src/browser-agent.ts` contains the isolated adapter for its pinned internal connection builder; keep the package pinned and review this adapter before upgrading `@cloudflare/playwright-mcp`.
 
 ## Production endpoint
 
@@ -77,6 +86,8 @@ node verify.mjs
 The smoke test checks the MCP OAuth challenge, protected-resource discovery, authorization-server discovery, DCR, PKCE construction, and that only `/authorize` is intercepted by Cloudflare Access.
 
 The final authorization-code and token flow is intentionally interactive because Cloudflare Access verifies the user's Cloudflare account before the consent page is shown.
+
+For Browser Run failures, the server distinguishes concurrent-session limits, browser-acquisition rate limits, and account browser-time quota exhaustion. Worker Observability is enabled in `wrangler.toml` for production diagnostics.
 
 ## Secrets
 

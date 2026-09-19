@@ -1,11 +1,19 @@
-import { env, WorkerEntrypoint } from "cloudflare:workers";
-import { createMcpAgent } from "@cloudflare/playwright-mcp";
+import { WorkerEntrypoint } from "cloudflare:workers";
 import {
   AuthorizationError,
   OAuthProvider,
   type AuthRequest,
   type OAuthHelpers,
 } from "@cloudflare/workers-oauth-provider";
+import {
+  InitializeRequestSchema,
+  JSONRPCMessageSchema,
+  isJSONRPCNotification,
+  isJSONRPCRequest,
+} from "@modelcontextprotocol/sdk/types.js";
+import { PlaywrightMCP } from "./browser-agent";
+
+export { PlaywrightMCP };
 
 const ORIGIN = "https://browser.202820.xyz";
 const MCP_URL = ORIGIN + "/mcp";
@@ -15,28 +23,203 @@ const encoder = new TextEncoder();
 
 interface Env {
   BROWSER: unknown;
-  MCP_OBJECT: unknown;
+  MCP_OBJECT: DurableObjectNamespace<PlaywrightMCP>;
   OAUTH_KV: KVNamespace;
   OAUTH_PROVIDER: OAuthHelpers;
   MCP_TOKEN: string;
 }
 
-interface AuthProps {
+interface AuthProps extends Record<string, unknown> {
   userId: string;
   scopes: string[];
 }
 
-const runtimeEnv = env as unknown as Env;
+async function stableMcpFetch(
+  request: Request,
+  env: Env,
+  props: AuthProps,
+): Promise<Response> {
+  if (request.method === "DELETE") {
+    return new Response(null, { status: 204 });
+  }
 
-export const PlaywrightMCP = createMcpAgent(runtimeEnv.BROWSER as never);
-const mcpHandler = PlaywrightMCP.serve("/mcp");
+  if (request.method !== "POST") {
+    return new Response("Method Not Allowed", {
+      status: 405,
+      headers: { Allow: "POST, DELETE" },
+    });
+  }
+
+  const contentType = request.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json")) {
+    return new Response("Unsupported Media Type", { status: 415 });
+  }
+
+  let rawMessage: unknown;
+  try {
+    rawMessage = await request.json();
+  } catch {
+    return Response.json(
+      {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32700, message: "Parse error" },
+      },
+      { status: 400 },
+    );
+  }
+
+  const rawMessages = Array.isArray(rawMessage) ? rawMessage : [rawMessage];
+  const messages: Array<ReturnType<typeof JSONRPCMessageSchema.parse>> = [];
+  for (const message of rawMessages) {
+    const parsed = JSONRPCMessageSchema.safeParse(message);
+    if (!parsed.success) {
+      return Response.json(
+        {
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32600, message: "Invalid Request" },
+        },
+        { status: 400 },
+      );
+    }
+    messages.push(parsed.data);
+  }
+
+  const mcpSessionId = `browser-${props.userId}`;
+  const durableId = env.MCP_OBJECT.idFromName(mcpSessionId);
+  const stub = env.MCP_OBJECT.get(durableId);
+  const hasInitialize = messages.some((message) =>
+    InitializeRequestSchema.safeParse(message).success,
+  );
+  const primaryRequest = messages.find(isJSONRPCRequest);
+
+  if (hasInitialize || !(await stub.isInitialized())) {
+    await stub._init(props);
+    await stub.setInitialized();
+  }
+
+  const upgradeUrl = new URL(request.url);
+  upgradeUrl.pathname = "/streamable-http";
+  let transportResponse: Response;
+  try {
+    transportResponse = await stub.fetch(
+      new Request(upgradeUrl, {
+        headers: {
+          Upgrade: "websocket",
+          "x-partykit-room": mcpSessionId,
+        },
+      }),
+    );
+  } catch (error) {
+    console.error("stable-mcp:stub-fetch-error", String(error));
+    const body = `event: message\r\ndata: ${JSON.stringify({
+      jsonrpc: "2.0",
+      id: primaryRequest?.id ?? null,
+      error: {
+        code: -32000,
+        message: error instanceof Error ? error.message : String(error),
+      },
+    })}\r\n\r\n`;
+    return new Response(body, {
+      status: 200,
+      headers: {
+        "Cache-Control": "no-cache",
+        "Content-Type": "text/event-stream",
+        "mcp-session-id": mcpSessionId,
+      },
+    });
+  }
+
+  const ws = transportResponse.webSocket;
+  if (!ws) {
+    return Response.json(
+      {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32001, message: "MCP transport unavailable" },
+      },
+      { status: 500 },
+    );
+  }
+
+  ws.accept();
+
+  const requestIds = new Set(
+    messages
+      .filter(isJSONRPCRequest)
+      .map((message) => String(message.id)),
+  );
+
+  if (requestIds.size === 0) {
+    for (const message of messages) {
+      ws.send(JSON.stringify(message));
+    }
+    ws.close();
+    return new Response(null, {
+      status: 202,
+      headers: { "mcp-session-id": mcpSessionId },
+    });
+  }
+
+  const result = await new Promise<unknown>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      ws.close();
+      reject(new Error("Timed out waiting for MCP response"));
+    }, 30_000);
+
+    ws.addEventListener("message", (event) => {
+      try {
+        const data =
+          typeof event.data === "string"
+            ? event.data
+            : new TextDecoder().decode(event.data as ArrayBuffer);
+        const message = JSON.parse(data);
+        const id =
+          message && typeof message === "object" && "id" in message
+            ? String(message.id)
+            : undefined;
+        if (id !== undefined && requestIds.has(id)) {
+          clearTimeout(timeout);
+          resolve(message);
+          ws.close();
+        }
+      } catch (error) {
+        clearTimeout(timeout);
+        reject(error);
+        ws.close();
+      }
+    });
+
+    ws.addEventListener("error", (event) => {
+      clearTimeout(timeout);
+      reject(event);
+    });
+
+    for (const message of messages) {
+      if (isJSONRPCNotification(message) || isJSONRPCRequest(message)) {
+        ws.send(JSON.stringify(message));
+      }
+    }
+  });
+
+  const body = `event: message\r\ndata: ${JSON.stringify(result)}\r\n\r\n`;
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "Cache-Control": "no-cache",
+      "Content-Type": "text/event-stream",
+      "mcp-session-id": mcpSessionId,
+    },
+  });
+}
 
 class McpApiHandler extends WorkerEntrypoint<Env, AuthProps> {
   async fetch(request: Request): Promise<Response> {
     if (!this.ctx.props.scopes.includes(SCOPE)) {
       return new Response("Forbidden", { status: 403 });
     }
-    return mcpHandler.fetch(request, this.env as never, this.ctx);
+    return stableMcpFetch(request, this.env, this.ctx.props);
   }
 }
 
@@ -74,13 +257,13 @@ function base64Url(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
-function fromBase64Url(value: string): Uint8Array {
+function fromBase64Url(value: string): ArrayBuffer {
   const padded = value
     .replace(/-/g, "+")
     .replace(/_/g, "/")
     .padEnd(Math.ceil(value.length / 4) * 4, "=");
   const binary = atob(padded);
-  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0)).buffer;
 }
 
 async function importHmacKey(secret: string): Promise<CryptoKey> {

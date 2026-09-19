@@ -3,6 +3,9 @@ main = "src/index.ts"
 compatibility_date = "2026-09-19"
 compatibility_flags = ["nodejs_compat", "no_websocket_standard_binary_type", "global_fetch_strictly_public"]
 
+[observability]
+enabled = true
+
 [browser]
 binding = "BROWSER"
 
